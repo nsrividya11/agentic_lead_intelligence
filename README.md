@@ -99,7 +99,9 @@ Opens a browser UI: type any goal, click "Run agent," and see the live reasoning
 
 ## Live deployment
 
-Deployed on [Render](https://render.com)'s free tier: **[live demo URL — add after deploying]**
+Deployed on [Render](https://render.com)'s free tier: **https://agentic-lead-intelligence.onrender.com**
+
+> Free-tier services spin down after 15 minutes of inactivity — the first request after idle can take 30-50 seconds to wake up.
 
 To deploy your own copy:
 1. Push this repo to GitHub.
