@@ -2,8 +2,8 @@
 SMOKE TEST — hits the real Tavily search API, no mocks.
 
 Run this before recording the demo / submitting, alongside
-test_smoke_openrouter.py, to confirm both real data sources the agent
-depends on are actually reachable right now.
+test_smoke_llm.py, to confirm all real data sources the agent depends
+on are actually reachable right now.
 """
 
 import sys

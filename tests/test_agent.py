@@ -230,6 +230,70 @@ def test_run_pipeline_end_to_end_ranks_scored_above_unscored():
     assert results[1]["score"] is None
 
 
+def test_run_pipeline_calls_on_phase_callback_for_every_checkpoint():
+    """
+    The on_phase callback (used by the Streamlit UI for live progress)
+    must fire start/done for understand/plan/find, and start/done for
+    each candidate that gets processed — with the candidate name passed
+    separately from detail, never requiring the caller to parse it out.
+    """
+    spec_output = """{
+        "search_query": "test companies", "target_count": 2, "entity_type": "company",
+        "criteria": ["hiring"], "scoring_weights": {"hiring": 100}
+    }"""
+    raw_results = [{"title": "Real Co", "url": "http://real.com", "content": "..."}]
+
+    def fake_call_llm(messages, **kwargs):
+        prompt = messages[0]["content"]
+        if "structured task spec" in prompt:
+            return spec_output
+        if "SPECIFIC, NAMEABLE candidate" in prompt:
+            return '{"name": "Real Co", "reason": "candidate"}'
+        if "Extract structured firmographic" in prompt:
+            return '{"name": "Real Co", "industry": "Tech", "found": true}'
+        if "Score this lead" in prompt:
+            return '{"score": 85, "justification": "Good fit."}'
+        raise AssertionError(f"Unexpected prompt: {prompt[:100]}")
+
+    def fake_web_search(query, max_results=8):
+        if "Real Co" in query:
+            return [{"title": "Real Co info", "url": "http://real.com", "content": "hiring"}]
+        return raw_results
+
+    events = []
+
+    def on_phase(phase, status, detail="", candidate_name=None):
+        events.append((phase, status, detail, candidate_name))
+
+    with patch("agent.call_llm", side_effect=fake_call_llm), \
+         patch("agent.web_search", side_effect=fake_web_search):
+        agent.run_pipeline("find 2 test companies", on_phase=on_phase)
+
+    phases_seen = {(e[0], e[1]) for e in events}
+    assert ("understand", "start") in phases_seen
+    assert ("understand", "done") in phases_seen
+    assert ("plan", "start") in phases_seen
+    assert ("plan", "done") in phases_seen
+    assert ("find", "start") in phases_seen
+    assert ("find", "done") in phases_seen
+
+    candidate_events = [e for e in events if e[0] == "candidate"]
+    assert ("candidate", "start", "", "Real Co") in candidate_events
+    assert any(e[0] == "candidate" and e[1] == "done" and e[3] == "Real Co" for e in candidate_events)
+
+
+def test_run_pipeline_works_without_on_phase_callback():
+    """on_phase is optional — omitting it must not raise."""
+    spec_output = """{
+        "search_query": "nonexistent things", "target_count": 3, "entity_type": "company",
+        "criteria": [], "scoring_weights": {}
+    }"""
+    with patch("agent.call_llm", return_value=spec_output), \
+         patch("agent.web_search", return_value=[]):
+        results = agent.run_pipeline("find 3 nonexistent things")  # no on_phase passed
+    assert results == []
+
+
 def test_run_pipeline_returns_empty_when_no_candidates_found():
     spec_output = """{
         "search_query": "nonexistent things", "target_count": 3, "entity_type": "company",
@@ -335,6 +399,8 @@ if __name__ == "__main__":
     test_score_step_parses_valid_json()
     test_score_step_handles_malformed_output()
     test_run_pipeline_end_to_end_ranks_scored_above_unscored()
+    test_run_pipeline_calls_on_phase_callback_for_every_checkpoint()
+    test_run_pipeline_works_without_on_phase_callback()
     test_run_pipeline_returns_empty_when_no_candidates_found()
     test_run_pipeline_returns_empty_when_all_candidates_rejected_by_extraction()
     test_run_pipeline_survives_one_candidate_exhausting_all_llm_models()

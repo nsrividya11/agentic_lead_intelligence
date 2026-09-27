@@ -3,8 +3,9 @@ Streamlit UI for the Lead Intelligence Agent.
 
 Lets a user type ANY free-text lead-generation goal, runs the real
 understand -> plan -> find -> enrich -> score pipeline (agent.py)
-against live web search + a live LLM, and shows both the agent's live
-step-by-step reasoning log and the final ranked leaderboard.
+against live web search + a live LLM, and shows LIVE progress as each
+phase runs (via agent.run_pipeline's on_phase callback) plus the full
+reasoning log and final ranked leaderboard.
 """
 
 import contextlib
@@ -37,14 +38,66 @@ goal = st.text_area(
 
 run_clicked = st.button("Run agent", type="primary", disabled=not goal.strip())
 
+# Icons for each checklist line's state.
+_ICONS = {"pending": "⚪", "active": "🔵", "done": "✅", "skip": "⏭️", "error": "⚠️"}
+
+_PHASE_LABELS = {
+    "understand": "Understand goal — deriving search strategy and scoring criteria",
+    "plan": "Plan — deciding the concrete steps for this goal",
+    "find": "Find — searching the web for candidate leads",
+}
+
+
+def _render_checklist(placeholder, phase_state, candidate_lines):
+    """Redraw the whole live checklist from current state."""
+    lines = []
+    for phase in ("understand", "plan", "find"):
+        state = phase_state.get(phase, "pending")
+        icon = _ICONS.get(state, "⚪")
+        detail = phase_state.get(f"{phase}_detail", "")
+        suffix = f" — {detail}" if detail else ""
+        lines.append(f"{icon} **{_PHASE_LABELS[phase]}**{suffix}")
+
+    if candidate_lines:
+        lines.append("")
+        lines.append("**Enrich & score candidates:**")
+        for name, (state, detail) in candidate_lines.items():
+            icon = _ICONS.get(state, "⚪")
+            suffix = f" — {detail}" if detail else ""
+            lines.append(f"{icon} {name}{suffix}")
+
+    placeholder.markdown("\n\n".join(lines))
+
+
 if run_clicked:
-    log_placeholder = st.empty()
+    checklist_placeholder = st.empty()
     log_buffer = io.StringIO()
 
-    with st.spinner("Agent is planning, searching, and scoring — this can take 1-2 minutes ..."):
+    phase_state = {"understand": "active"}
+    candidate_lines = {}
+    _render_checklist(checklist_placeholder, phase_state, candidate_lines)
+
+    def on_phase(phase, status, detail="", candidate_name=None):
+        if phase == "candidate":
+            candidate_lines[candidate_name] = (status, detail if status != "start" else "")
+        else:
+            if status == "start":
+                phase_state[phase] = "active"
+            elif status == "done":
+                phase_state[phase] = "done"
+                phase_state[f"{phase}_detail"] = detail
+                # Move to the next phase's "active" state immediately for
+                # a smoother feel instead of a flat moment between phases.
+                next_phase = {"understand": "plan", "plan": "find"}.get(phase)
+                if next_phase:
+                    phase_state[next_phase] = "active"
+
+        _render_checklist(checklist_placeholder, phase_state, candidate_lines)
+
+    with st.spinner("Agent is working — this can take 1-2 minutes ..."):
         try:
             with contextlib.redirect_stdout(log_buffer):
-                results = run_pipeline(goal.strip())
+                results = run_pipeline(goal.strip(), on_phase=on_phase)
         except RuntimeError as exc:
             st.error(
                 f"Could not complete the run: {exc}\n\n"
@@ -52,7 +105,7 @@ if run_clicked:
             )
             results = None
         finally:
-            with st.expander("Agent reasoning log (plan → find → enrich → score)", expanded=(results is None)):
+            with st.expander("Full agent reasoning log (plan → find → enrich → score)", expanded=(results is None)):
                 st.code(log_buffer.getvalue() or "(no output captured)", language=None)
 
     if results:

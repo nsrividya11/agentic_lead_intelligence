@@ -228,13 +228,40 @@ Respond ONLY as JSON: {{"score": <int 0-100>, "justification": "<1-2 sentences>"
     return parsed
 
 
-def run_pipeline(user_goal: str) -> list[dict]:
+def run_pipeline(user_goal: str, on_phase=None) -> list[dict]:
+    """
+    Run the full pipeline. `on_phase`, if given, is called at each
+    major checkpoint, so a caller (e.g. a UI) can render live progress
+    without parsing stdout:
+
+      on_phase(phase, status, detail="", candidate_name=None)
+
+    phase: "understand" | "plan" | "find" | "candidate"
+    status: "start" | "done" | "skip" | "error"
+    detail: short human-readable context (counts, score, reason, etc.)
+    candidate_name: set only when phase == "candidate" — the candidate
+      this event is about, kept separate from `detail` so a name
+      containing punctuation never has to be parsed back out.
+    """
+    def notify(phase, status, detail="", candidate_name=None):
+        if on_phase is not None:
+            on_phase(phase, status, detail, candidate_name)
+
+    notify("understand", "start")
     spec = understand_step(user_goal)
+    notify("understand", "done", f"{len(spec.get('criteria', []))} criteria derived")
+
+    notify("plan", "start")
     plan_step(spec)
+    notify("plan", "done")
+
+    notify("find", "start")
     raw_results = find_step(spec)
+    notify("find", "done", f"{len(raw_results)} raw results")
 
     if not raw_results:
         print("\n[RESPOND] No candidates found for this goal.")
+        notify("score", "done", "no candidates found")
         return []
 
     results = []
@@ -265,10 +292,13 @@ def run_pipeline(user_goal: str) -> list[dict]:
             continue
         seen_names.add(dedup_key)
 
+        notify("candidate", "start", candidate_name=candidate["name"])
+
         try:
             enriched = enrich_step(candidate)
         except RuntimeError as exc:
             print(f"[OBSERVE] Enrichment LLM call failed for {candidate['name']}: {exc}")
+            notify("candidate", "error", "enrichment LLM unavailable", candidate["name"])
             results.append({
                 "name": candidate["name"],
                 "score": None,
@@ -277,6 +307,7 @@ def run_pipeline(user_goal: str) -> list[dict]:
             continue
 
         if not enriched.get("found"):
+            notify("candidate", "skip", "no enrichment data", candidate["name"])
             results.append({
                 "name": candidate["name"],
                 "score": None,
@@ -288,6 +319,7 @@ def run_pipeline(user_goal: str) -> list[dict]:
             verdict = score_step(enriched, spec)
         except RuntimeError as exc:
             print(f"[OBSERVE] Scoring LLM call failed for {enriched['name']}: {exc}")
+            notify("candidate", "error", "scoring LLM unavailable", enriched["name"])
             results.append({
                 "name": enriched["name"],
                 "score": None,
@@ -295,6 +327,7 @@ def run_pipeline(user_goal: str) -> list[dict]:
             })
             continue
 
+        notify("candidate", "done", f"scored {verdict.get('score')}", enriched["name"])
         results.append({
             "name": enriched["name"],
             "score": verdict.get("score"),
