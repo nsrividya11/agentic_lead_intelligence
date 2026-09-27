@@ -80,6 +80,47 @@ def test_raises_when_all_models_exhausted(monkeypatch):
             assert "All free models failed" in str(exc)
 
 
+def test_daily_quota_exhaustion_skips_retry_and_falls_back_immediately(monkeypatch):
+    """
+    A daily-quota 429 ("free-models-per-day") is not transient within
+    this run — retrying it wastes _RETRY_WAIT_SECONDS for nothing, so
+    call_llm should skip straight to the next model without sleeping.
+    """
+    sleep_calls = []
+    monkeypatch.setattr(llm.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+
+    quota_exhausted = _fake_response(429, {
+        "error": {
+            "message": "Rate limit exceeded: free-models-per-day. Add 10 credits to unlock 1000 free model requests per day",
+            "code": 429,
+        }
+    })
+    ok_response = _fake_response(200, {"choices": [{"message": {"content": "next model answer"}}]})
+
+    with patch("tools.llm.requests.post", side_effect=[quota_exhausted, ok_response]) as mock_post:
+        result = llm.call_llm([{"role": "user", "content": "hi"}])
+        assert result == "next model answer"
+        assert mock_post.call_count == 2  # first model tried once, no retry, then fallback
+        assert sleep_calls == []  # never slept — daily quota isn't worth retrying
+
+
+def test_embedded_error_in_200_response_is_treated_as_failure():
+    """
+    Some providers (observed with an Nvidia-backed free model) return
+    HTTP 200 with an error embedded in the JSON body instead of a real
+    error status code. call_llm must detect this and fall back.
+    """
+    embedded_error = _fake_response(200, {
+        "id": "gen-123",
+        "error": {"message": "Upstream error from Nvidia: ResourceExhausted: Worker local total request limit reached (16/16)", "code": 502},
+    })
+    ok_response = _fake_response(200, {"choices": [{"message": {"content": "fallback worked"}}]})
+
+    with patch("tools.llm.requests.post", side_effect=[embedded_error, ok_response]):
+        result = llm.call_llm([{"role": "user", "content": "hi"}])
+        assert result == "fallback worked"
+
+
 def test_handles_200_with_empty_choices():
     empty_choices = _fake_response(200, {"choices": []})
     ok_response = _fake_response(200, {"choices": [{"message": {"content": "fallback ok"}}]})
@@ -112,6 +153,8 @@ if __name__ == "__main__":
     test_retries_once_on_429_before_falling_back(ctx)
     test_recovers_immediately_if_retry_succeeds(ctx)
     test_raises_when_all_models_exhausted(ctx)
+    test_daily_quota_exhaustion_skips_retry_and_falls_back_immediately(ctx)
+    test_embedded_error_in_200_response_is_treated_as_failure()
     test_handles_200_with_empty_choices()
     test_handles_network_exception()
     print("All llm tests passed.")

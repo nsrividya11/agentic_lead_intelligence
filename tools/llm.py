@@ -53,6 +53,11 @@ def _try_model(model: str, messages: list[dict], temperature: float) -> tuple[st
         )
         if response.status_code == 200:
             data = response.json()
+            if data.get("error"):
+                # Some providers return HTTP 200 with an error embedded in the
+                # body (e.g. upstream rate limit) instead of a real HTTP status.
+                err_code = data["error"].get("code")
+                return None, f"{model} -> embedded error (code {err_code}): {data['error'].get('message')}"
             if data.get("choices"):
                 return data["choices"][0]["message"]["content"], None
             return None, f"{model} -> HTTP 200 but no choices: {response.text[:300]}"
@@ -63,9 +68,11 @@ def _try_model(model: str, messages: list[dict], temperature: float) -> tuple[st
 
 def call_llm(messages: list[dict], temperature: float = 0.2) -> str:
     """
-    Call free models in order. On a rate limit (429), retry that same
-    model once after a short wait before moving to the next model —
-    this is the agent's error-handling/robustness behaviour.
+    Call free models in order. On a transient rate limit, retry that
+    same model once after a short wait before moving to the next model.
+    A daily-quota exhaustion ("free-models-per-day") is NOT transient —
+    waiting won't help within this run, so it skips straight to the
+    next model instead of wasting a retry.
     """
     last_error = None
     for model in FREE_MODELS:
@@ -74,7 +81,14 @@ def call_llm(messages: list[dict], temperature: float = 0.2) -> str:
             return content
         last_error = error
 
-        if error and "429" in error:
+        is_daily_quota_exhausted = error and "free-models-per-day" in error
+        is_transient_rate_limit = (
+            not is_daily_quota_exhausted
+            and error
+            and any(code in error for code in ("429", "502", "ResourceExhausted"))
+        )
+
+        if is_transient_rate_limit:
             print(f"[OBSERVE] {model} rate-limited — retrying once after "
                   f"{_RETRY_WAIT_SECONDS}s before falling back ...")
             time.sleep(_RETRY_WAIT_SECONDS)
@@ -82,6 +96,9 @@ def call_llm(messages: list[dict], temperature: float = 0.2) -> str:
             if content is not None:
                 return content
             last_error = error
+        elif is_daily_quota_exhausted:
+            print(f"[OBSERVE] {model} hit its daily free-tier quota — "
+                  f"skipping retry, falling back to next free model ...")
 
         print(f"[OBSERVE] {model} failed, falling back to next free model ...")
 

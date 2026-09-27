@@ -1,62 +1,64 @@
-# Lead Finder + Enrichment + Scoring Agent
+# Lead Intelligence Agent
 
 **Submission for Techvruk's AI Agentic System Challenge.**
 
 ## What this is
 
-An AI agent that takes a raw lead (name, email, company) and autonomously:
+An AI agent that takes **any free-text lead-generation goal** — e.g. *"Find 5 Indian ed-tech companies with 100+ employees that are hiring AI engineers"* — and autonomously:
 
-1. **Plans** what information it needs to evaluate the lead.
-2. **Acts** by calling an enrichment tool to fetch firmographic and signal data.
-3. **Observes** whether the tool call succeeded, and handles the failure case gracefully (skips scoring instead of crashing).
-4. **Responds** by asking an LLM to score the lead against an Ideal Customer Profile (ICP) and justify the score.
+1. **Understands** the goal: an LLM turns it into a structured task spec (search queries, target count, scoring criteria, weights). Nothing is hardcoded — ask for colleges, startups, people, or anything else, and the criteria are derived fresh from what you actually asked.
+2. **Plans** the concrete steps needed for that specific goal.
+3. **Finds** real candidates via live web search (multiple query variants, merged and deduped).
+4. **Enriches** each candidate with a second, targeted real web search, then has the LLM extract structured firmographic fields from the raw results.
+5. **Observes** whether each tool call succeeded, and handles failure gracefully — a candidate with no data, or an LLM call that fails, is marked unscored instead of crashing the run.
+6. **Scores** each enriched candidate against the criteria derived from the *original* goal, with a reasoned justification.
 
-It then ranks every lead it processed and prints a final, reasoned leaderboard.
+It returns a ranked, reasoned leaderboard. There is no seed lead list, no static ICP file, and no mock data anywhere in the pipeline — every result comes from a live search and a live LLM call.
 
 ## Why this problem
 
-Techvruk's own product is an opportunity-matching platform — connecting professionals to opportunities. A lead-scoring agent is the same core capability wearing a different hat: given a person/entity and a target profile, decide how good the match is and explain why.
-
-This project is built as **a first-pass prototype for a Techvruk-style opportunity-matching engine**, not just a generic agent demo. The `data/icp.json` config is written from Techvruk's own hiring/visibility angle, and the enrichment tool's interface is deliberately shaped so it could sit behind Techvruk's own candidate/opportunity-matching feature with no redesign — only the data source needs to change.
+Techvruk's own product is an opportunity-matching platform — connecting professionals to opportunities. A lead-finding-and-scoring agent is the same core capability wearing a different hat: given an open-ended goal, discover real candidates and decide how good each match is, with reasoning attached.
 
 ## Architecture
 
 ```
-run_pipeline()
-  for each lead:
-    plan_step()     -> decide what's needed to score this lead
-    act_step()       -> call search_company_info() [tool]
-    observe_step()   -> check success; skip gracefully on failure
-    respond_step()   -> LLM reasons about ICP fit, returns {score, justification}
-  -> rank all leads by score, print leaderboard
+run_pipeline(user_goal)
+  understand_step(goal)   -> LLM derives {search_queries, target_count, criteria, scoring_weights}
+  plan_step(spec)          -> prints the concrete steps for THIS goal
+  find_step(spec)           -> live web search (Tavily), multiple query variants, merged + deduped
+  for each raw search result (until target_count reached):
+    extract_candidate_step() -> LLM checks if this result names a real, relevant candidate
+    enrich_step()             -> second live search + LLM extracts structured fields
+    score_step()               -> LLM scores against the goal's own criteria
+  -> rank by score, unscored candidates listed separately
 ```
 
-- **State**: each lead's enrichment result and verdict are carried through the loop and collected into a shared `results` list — the agent's context persists across steps, not just within one call.
-- **Tool use**: `tools/enrichment.py` is a real tool call in the agentic sense — swappable, single-responsibility, contract-based.
-- **Error handling**: if enrichment finds nothing (`found: False`), the agent doesn't crash or hallucinate a score — it marks the lead unscored and explains why. If the LLM call is rate-limited, the client retries once, then rotates to the next free model.
+- **State**: the task spec, seen-candidate set, and accumulating results list are all threaded through the loop — the agent's context persists across every step of a run.
+- **Tool use**: `tools/search.py` (Tavily) is called twice per candidate (find + enrich) with different, purpose-built queries — a real, swappable tool contract.
+- **Error handling**: search failures, unparseable LLM responses, and full LLM-quota exhaustion are all caught per-candidate so one failure doesn't take down the whole batch. A daily free-tier quota error is detected and skipped immediately rather than retried.
 
-## Why mock data, not a live API
+## Real data, not mock data
 
-The enrichment tool (`tools/enrichment.py`) is stubbed with local seed data (`data/seed_leads.json`) instead of calling a real provider (Clearbit, Apollo, LinkedIn API). This is deliberate:
+Both external calls are live:
 
-- **Zero cost, zero flake risk.** A live scraping/API call could fail live during the demo for reasons unrelated to the agent's logic (rate limits, auth, network). The agent's reasoning is what's being evaluated, not a third-party API's uptime.
-- **The swap point is explicit.** `search_company_info(email)` has one job and one contract: `{name, company, title, raw_signal, found}`. Point it at a real API and nothing else in the agent changes.
+- **Search**: [Tavily](https://tavily.com) — a free-tier search API purpose-built for LLM agents. `tools/search.py` calls it twice per candidate: once (via multiple query variants) to discover candidates, once per candidate to enrich it.
+- **Reasoning**: [OpenRouter](https://openrouter.ai), using only free-tier (`:free`) models, per contest fairness guidelines.
 
-## LLM: OpenRouter, free-tier only
+Nothing about the entity type, criteria, or scoring rubric is hardcoded — they're all derived by the LLM from whatever the user typed.
 
-All reasoning calls go through [OpenRouter](https://openrouter.ai), using **only free-tier (`:free`) models** — no paid usage, per contest fairness guidelines.
+## LLM: OpenRouter, free-tier only, with fallback
 
-To handle free-tier rate limits gracefully (a real constraint, not a hypothetical), `tools/llm.py`:
-1. Tries the current model.
-2. On a 429 (rate limit), waits briefly and retries once.
-3. If it still fails, rotates to the next free model in the list.
+`tools/llm.py` calls a list of free models in priority order:
+1. Try the current model.
+2. On a **transient** rate limit (429/502/embedded provider error), wait briefly and retry once.
+3. On a **daily quota exhaustion** ("free-models-per-day"), skip the retry — it won't clear within the run — and fall back immediately.
+4. If a model fails either way, rotate to the next free model.
 
-This fallback rotation is itself part of the agent's **workflow robustness** — the same principle as retrying a flaky tool call, applied to the LLM provider itself.
+> OpenRouter's free tier caps out at roughly 50 requests/day account-wide unless a small credit balance is added (their own error message: *"Add 10 credits to unlock 1000 free model requests per day"*). Heavy testing in one day can exhaust it — this is a real constraint of the free tier, not a bug.
+>
+> OpenRouter's free-model catalog also changes over time. If a model slug in `FREE_MODELS` (`tools/llm.py`) starts 404ing, refresh it via `GET https://openrouter.ai/api/v1/models` → filter for `id` ending in `:free`.
 
-> OpenRouter's free-model catalog changes over time. If a model slug in `FREE_MODELS` (`tools/llm.py`) starts 404ing, refresh it via:
-> `GET https://openrouter.ai/api/v1/models` → filter for `id` ending in `:free`.
-
-## Setup & run
+## Setup & run (CLI)
 
 ```bash
 cd lead-agent
@@ -64,88 +66,126 @@ python -m venv .venv && .venv\Scripts\activate   # Windows
 pip install -r requirements.txt
 ```
 
-Create a `.env` file (already present in this submission for judging convenience, gitignored otherwise):
+Create a `.env` file:
 
 ```
-OPENROUTER_API_KEY=your_key_here
+OPENROUTER_API_KEY=your_openrouter_key
+TAVILY_API_KEY=your_tavily_key
 ```
 
-Get a free key at [openrouter.ai](https://openrouter.ai/keys) — no payment method required for free-tier models.
+- Get a free OpenRouter key at [openrouter.ai/keys](https://openrouter.ai/keys) — no payment method required for free-tier models.
+- Get a free Tavily key at [tavily.com](https://tavily.com) — no card required for the free tier.
 
-Run:
+Run with any goal:
+
+```bash
+python agent.py "Find 5 Indian ed-tech companies with 100+ employees that are hiring AI engineers"
+```
+
+Or run without an argument and it will prompt you:
 
 ```bash
 python agent.py
 ```
+
+## Run the web UI locally
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+Opens a browser UI: type any goal, click "Run agent," and see the live reasoning log plus the final ranked leaderboard.
+
+## Live deployment
+
+Deployed on [Render](https://render.com)'s free tier: **[live demo URL — add after deploying]**
+
+To deploy your own copy:
+1. Push this repo to GitHub.
+2. On Render, create a new Web Service from the repo — `render.yaml` in this directory configures the build/start commands automatically.
+3. Add `OPENROUTER_API_KEY` and `TAVILY_API_KEY` as environment variables in Render's dashboard (never commit them — `render.yaml` deliberately marks them `sync: false` so Render prompts for them instead of reading them from the repo).
 
 ## Tests
 
 ```bash
 pip install pytest
 
-# Fast, free, fully mocked unit tests (enrichment, LLM fallback logic, agent orchestration)
-python -m pytest tests/ --ignore=tests/test_smoke_openrouter.py -v
+# Fast, free, fully mocked unit tests (search/LLM fallback logic, agent orchestration)
+python -m pytest tests/ --ignore=tests/test_smoke_openrouter.py --ignore=tests/test_smoke_search.py -v
 
-# Real smoke test — hits the live OpenRouter API with real payloads.
-# Run this once before recording the demo / submitting, not on every change.
+# Real smoke tests — hit the live APIs with real payloads.
+# Run these once before recording the demo / redeploying, not on every change.
 python tests/test_smoke_openrouter.py
+python tests/test_smoke_search.py
 ```
 
-19 unit tests cover:
-- `tools/enrichment.py`: known/unknown lookups, return-shape contract
-- `tools/llm.py`: first-model success, fallback on error, 429 retry-then-fallback, all-models-exhausted, malformed responses, network exceptions — all mocked, no real API calls
-- `agent.py`: each pipeline stage (plan/act/observe/respond) individually, JSON parsing (including markdown-fenced and malformed LLM output), and a full `run_pipeline()` run verifying scored leads always rank above unscored ones
+27 unit tests cover:
+- `tools/llm.py`: first-model success, fallback on error, transient-429 retry-then-fallback, daily-quota-exhaustion skip-retry, embedded-error-in-200-response detection, all-models-exhausted, malformed responses, network exceptions — all mocked
+- `agent.py`: every pipeline stage individually (understand/plan/find/extract/enrich/score), multi-query merge/dedupe, per-candidate error isolation (one candidate's total LLM failure doesn't crash the batch), and full `run_pipeline()` runs
 
-The smoke test hits the real API and checks: the key authenticates, at least one free model is currently reachable, `call_llm()` works against live traffic, and a full `respond_step()` call on a real seed lead returns a valid 0–100 score.
+The smoke tests hit the real APIs and check: keys authenticate, live search returns relevant results, at least one free LLM model is reachable, and a full `score_step()` call against a live LLM returns a valid 0–100 score.
 
 ## Sample output
 
 ```
-======================================================================
-Processing lead: Aditi Rao <aditi.rao@brightwave.io>
+[UNDERSTAND] Parsing goal into a structured task spec ...
+[UNDERSTAND] search_queries=['list of Indian ed-tech companies hiring AI engineers', 'top Indian education technology companies AI engineer jobs', ...], target_count=4, criteria=['Indian', 'ed-tech', '100+ employees', 'hiring AI engineers']
 
-[PLAN] Score lead aditi.rao@brightwave.io against Techvruk's ICP
-       1. Enrich lead with firmographic + signal data
-       2. Verify enrichment succeeded (observe)
-       3. Score against ICP using LLM reasoning
-       4. Return structured verdict with justification
-[ACT]  Calling enrichment tool for aditi.rao@brightwave.io ...
-[OBSERVE] Enrichment succeeded: Brightwave Analytics / VP of Engineering
-[RESPOND] Asking LLM to score lead against ICP ...
+[PLAN] Find, enrich, and rank 4 company(s)
+       1. Search the web for candidates using 4 query variant(s): ...
+       2. For each candidate, run a targeted follow-up search to enrich it
+       3. Extract structured fields from search results (LLM)
+       4. Score each candidate against: Indian, ed-tech, 100+ employees, hiring AI engineers
+       5. Rank and return the leaderboard
+
+[FIND] Searching the web for candidates using 4 query variant(s) ...
+[OBSERVE] 14 unique raw search results across all queries
+[ACT]  Enriching candidate: CommLab India ...
+[OBSERVE] Enriched CommLab India: industry=Rapid eLearning Solutions, size=None
+[RESPOND] Scoring CommLab India ...
 ...
+
 ======================================================================
 FINAL RANKED RESULTS
 ======================================================================
-1. Aditi Rao (aditi.rao@brightwave.io) — score: 98
-   Aditi Rao is a VP of Engineering, an exact target title, and her signal explicitly
-   mentions scaling a 40-person engineering team and hiring interns for Q4...
-2. Priya Nair (priya@loomworks.co) — score: 92
-   ...
-5. Marcus Chen (m.chen@fieldstonecap.com) — score: 15
-   Marcus Chen is an Analyst, not a target title, and the signal only shows general
-   interest in AI hiring tools...
+1. CommLab India — score: 50
+   The lead is Indian and operates in the ed-tech sector, but size and AI engineer
+   hiring signals are not confirmed.
+2. Arivihan Technologies — score: 50
+   Matches Indian and ed-tech criteria, but size is below 100+ employees and no
+   hiring AI engineers signal.
+3. Edmo — score: 25
+   The lead matches the Indian criterion (Bangalore, IN) but fails on ed-tech
+   (Software Development industry), 100+ employees (11-50 employees), and hiring
+   AI engineers (no hiring signal).
 ```
+
+Scores are intentionally not inflated — when real data doesn't clearly support a criterion, the agent says so.
 
 ## Path to production
 
-To take this from prototype to something Techvruk could actually run:
-
-1. Replace `tools/enrichment.py`'s mock lookup with a real provider (Apollo.io, People Data Labs, or Techvruk's own user/opportunity database).
-2. Replace `data/icp.json` with a per-company or per-recruiter configurable ICP.
-3. Swap free-tier OpenRouter models for a paid tier or dedicated model once volume justifies the cost — the fallback architecture in `tools/llm.py` means this is a one-line config change, not a rewrite.
-4. Persist results to a database instead of stdout, and expose the ranked leaderboard via an API/dashboard.
+1. Swap Tavily for a paid/higher-limit search provider once volume justifies the cost.
+2. Add caching so re-running a similar goal doesn't re-search/re-enrich identical candidates.
+3. Swap free-tier OpenRouter models for a paid tier once volume justifies the cost — the fallback architecture in `tools/llm.py` means this is a one-line config change, not a rewrite.
+4. Persist results to a database instead of printing them, and expose the ranked leaderboard via a proper API/dashboard for multi-user use.
 
 ## Files
 
 ```
 lead-agent/
-├── agent.py              # orchestrator: plan/act/observe/respond loop
+├── agent.py              # orchestrator: understand/plan/find/enrich/score pipeline
+├── app.py                 # Streamlit web UI wrapping agent.py
+├── render.yaml             # Render deployment config
 ├── tools/
-│   ├── enrichment.py      # mocked enrichment tool (swap point for real API)
-│   └── llm.py             # OpenRouter client with free-model fallback + retry
-├── data/
-│   ├── seed_leads.json    # 5 mock leads
-│   └── icp.json           # Techvruk-style ideal customer profile
+│   ├── search.py            # Tavily web search tool (find + enrich)
+│   ├── llm.py                # OpenRouter client with free-model fallback + retry
+│   └── json_utils.py          # shared LLM-JSON-response parsing helper
+├── tests/
+│   ├── test_agent.py            # mocked unit tests for the pipeline
+│   ├── test_llm.py               # mocked unit tests for the LLM client
+│   ├── test_smoke_openrouter.py   # real smoke test against live OpenRouter
+│   └── test_smoke_search.py        # real smoke test against live Tavily
 ├── requirements.txt
-└── .env                   # OpenRouter API key (gitignored in real use)
+└── .env                   # API keys (gitignored — never committed)
 ```

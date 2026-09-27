@@ -1,52 +1,96 @@
 """
-Lead Finder + Enrichment + Scoring Agent
-=========================================
+Lead Intelligence Agent — Finder + Enrichment + Scoring
+=========================================================
 
-Prototype for a Techvruk-style opportunity-matching engine: given a raw
-lead, the agent plans out how to evaluate it, enriches it with
-firmographic/signal data, scores it against Techvruk's ICP, and returns
-a ranked, reasoned verdict.
+Takes ANY free-text lead-generation goal (e.g. "Find 8 Indian ed-tech
+companies with 100+ employees that are hiring AI engineers") and
+autonomously:
 
-Workflow (visible at every step, printed to stdout for the demo):
+    UNDERSTAND -> LLM turns the goal into a structured task spec
+                  (search query, target count, scoring criteria) —
+                  nothing about criteria or targets is hardcoded.
+    PLAN       -> decide the concrete steps needed for this specific goal
+    FIND       -> real web search (Tavily) to discover candidate leads
+    ACT/ENRICH -> a second, targeted real web search per candidate,
+                  then the LLM extracts structured fields from the
+                  raw results (size, hiring signals, industry, etc.)
+    OBSERVE    -> check each tool call's result; skip gracefully on failure
+    SCORE      -> LLM scores each enriched candidate against the
+                  criteria derived from the ORIGINAL goal
+    RESPOND    -> ranked, reasoned leaderboard
 
-    PLAN     -> decide what info is needed to score this lead
-    ACT      -> call the enrichment tool to fetch that info
-    OBSERVE  -> check whether the tool call succeeded; handle failure
-    RESPOND  -> ask the LLM to score + justify against the ICP
-
-This loop repeats per lead, then the agent ranks all leads and prints
-a final summary — showing planning, tool use, state, and error handling
-in one run.
+Every run is driven entirely by the user's question — there is no
+seed lead list and no static ICP file. Real web data only.
 """
 
 import json
-import os
 import sys
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8")
 
-from tools.enrichment import search_company_info
+from tools.search import web_search
 from tools.llm import call_llm
-
-_ICP_PATH = os.path.join(os.path.dirname(__file__), "data", "icp.json")
-_LEADS_PATH = os.path.join(os.path.dirname(__file__), "data", "seed_leads.json")
+from tools.json_utils import parse_llm_json
 
 
-def load_json(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
+def understand_step(user_goal: str) -> dict:
+    """
+    UNDERSTAND: turn a free-text goal into a structured task spec.
+    This replaces any hardcoded ICP/criteria file — the criteria are
+    derived fresh from whatever the user actually asked.
+    """
+    prompt = f"""A user gave this lead-generation goal:
+
+"{user_goal}"
+
+Turn this into a structured task spec. Respond ONLY as JSON in this exact shape:
+{{
+  "search_queries": ["<query 1>", "<query 2>", "<query 3>"],
+  "target_count": <int, how many leads the user wants; default to 5 if not specified>,
+  "entity_type": "<what kind of entity is being searched for, e.g. 'company', 'college', 'person'>",
+  "criteria": ["<short criterion 1>", "<short criterion 2>", "..."],
+  "scoring_weights": {{"<criterion>": <int weight 0-100, all weights sum to 100>}}
+}}
+
+For "search_queries", give 2-4 DIFFERENT search queries designed to surface pages that
+list, name, or profile SPECIFIC real entities matching the goal (e.g. "list of", "top",
+"directory", "startups", a specific well-known industry publication/database name) —
+NOT generic keyword-stuffed queries that mostly surface news articles or blog posts
+ABOUT the topic rather than pages naming actual candidates.
+
+The criteria and weights must be derived from what the user actually asked for — do not
+invent generic criteria that aren't implied by the goal."""
+
+    print(f"\n[UNDERSTAND] Parsing goal into a structured task spec ...")
+    raw = call_llm([{"role": "user", "content": prompt}])
+    spec = parse_llm_json(raw)
+
+    if spec is None:
+        raise RuntimeError(f"Could not parse task spec from LLM output: {raw[:300]}")
+
+    spec.setdefault("target_count", 5)
+    if not spec.get("search_queries"):
+        # Defensive fallback if the model returns the old single-query shape.
+        spec["search_queries"] = [spec["search_query"]] if spec.get("search_query") else [user_goal]
+
+    print(f"[UNDERSTAND] search_queries={spec.get('search_queries')}, "
+          f"target_count={spec.get('target_count')}, criteria={spec.get('criteria')}")
+    return spec
 
 
-def plan_step(lead_email: str) -> dict:
-    """PLAN: decide the steps needed to evaluate this lead."""
+def plan_step(spec: dict) -> dict:
+    """PLAN: decide the concrete steps for THIS goal (not a fixed script)."""
+    queries_str = "; ".join(spec.get("search_queries", []))
     plan = {
-        "goal": f"Score lead {lead_email} against Techvruk's ICP",
+        "goal": f"Find, enrich, and rank {spec['target_count']} {spec.get('entity_type', 'lead')}(s)",
         "steps": [
-            "1. Enrich lead with firmographic + signal data",
-            "2. Verify enrichment succeeded (observe)",
-            "3. Score against ICP using LLM reasoning",
-            "4. Return structured verdict with justification",
+            f"1. Search the web for candidates using {len(spec.get('search_queries', []))} "
+            f"query variant(s): {queries_str}",
+            "2. For each candidate, run a targeted follow-up search to enrich it",
+            "3. Extract structured fields from search results (LLM)",
+            f"4. Score each candidate against: {', '.join(spec.get('criteria', []))}",
+            "5. Rank and return the leaderboard",
         ],
     }
     print(f"\n[PLAN] {plan['goal']}")
@@ -55,80 +99,204 @@ def plan_step(lead_email: str) -> dict:
     return plan
 
 
-def act_step(lead_email: str) -> dict:
-    """ACT: call the enrichment tool."""
-    print(f"[ACT]  Calling enrichment tool for {lead_email} ...")
-    result = search_company_info(lead_email)
-    return result
+def find_step(spec: dict) -> list[dict]:
+    """
+    FIND: real web search to discover candidate leads for this goal.
+    Runs several query variants (from understand_step) rather than one,
+    since a single generic query tends to surface news/blog posts ABOUT
+    a topic rather than pages naming actual candidates. Results across
+    queries are merged and deduped by URL.
+    """
+    queries = spec.get("search_queries") or [spec.get("search_query", "")]
+    print(f"\n[FIND] Searching the web for candidates using {len(queries)} query variant(s) ...")
+
+    per_query_limit = max(4, spec["target_count"])
+    seen_urls = set()
+    merged_results = []
+
+    for query in queries:
+        try:
+            results = web_search(query, max_results=per_query_limit)
+        except RuntimeError as exc:
+            print(f"[OBSERVE] Search failed for query {query!r}: {exc}")
+            continue
+
+        new_count = 0
+        for r in results:
+            if r["url"] in seen_urls:
+                continue
+            seen_urls.add(r["url"])
+            merged_results.append(r)
+            new_count += 1
+        print(f"[OBSERVE] Query {query!r} -> {len(results)} results ({new_count} new)")
+
+    print(f"[OBSERVE] {len(merged_results)} unique raw search results across all queries")
+    return merged_results
 
 
-def observe_step(enrichment_result: dict) -> bool:
-    """OBSERVE: check tool result; this is the error-handling seam."""
-    if not enrichment_result.get("found"):
-        print(f"[OBSERVE] No data found for {enrichment_result.get('email')} — "
-              f"skipping scoring, marking as low-priority/unscored.")
-        return False
-    print(f"[OBSERVE] Enrichment succeeded: {enrichment_result['company']} "
-          f"/ {enrichment_result['title']}")
-    return True
+def extract_candidate_step(raw_result: dict, spec: dict) -> dict:
+    """
+    From one raw search result (title/url/content), ask the LLM to
+    pull out a candidate name/organization IF it genuinely matches the
+    user's original criteria — the first-pass structuring and relevance
+    filter of a Finder result into something Enrichment can work with.
+    """
+    prompt = f"""A user is looking for leads matching these criteria: {json.dumps(spec.get("criteria", []))}
+Entity type they want: {spec.get("entity_type", "organization")}
 
+Does this web search result represent a SPECIFIC, NAMEABLE candidate that plausibly
+matches the entity type and criteria above? Reject generic/well-known entities that
+were only mentioned in passing (e.g. a huge global company appearing in an unrelated
+listicle), off-topic results, list articles, ads, or anything not clearly a real
+distinct candidate matching what the user asked for.
 
-def respond_step(enrichment_result: dict, icp: dict) -> dict:
-    """RESPOND: ask the LLM to reason about fit and produce a score."""
-    prompt = f"""You are a lead-scoring assistant for Techvruk, an opportunity-matching platform.
+Respond ONLY as JSON:
+{{"name": "<organization or person name>", "reason": "<why this matches, 1 sentence>"}}
 
-ICP (Ideal Customer Profile):
-{json.dumps(icp, indent=2)}
+If it does not clearly match, respond with:
+{{"name": null, "reason": "<why it does not match>"}}
 
-Lead to evaluate:
-{json.dumps(enrichment_result, indent=2)}
+Title: {raw_result['title']}
+URL: {raw_result['url']}
+Content: {raw_result['content'][:800]}"""
 
-Score this lead's fit against the ICP from 0-100, and give a 1-2 sentence justification.
-Respond ONLY as JSON in this exact shape:
-{{"score": <int 0-100>, "justification": "<text>"}}
-"""
-    print("[RESPOND] Asking LLM to score lead against ICP ...")
     raw = call_llm([{"role": "user", "content": prompt}])
+    parsed = parse_llm_json(raw)
+    if parsed is None or not parsed.get("name"):
+        return None
+    return {"name": parsed["name"], "source_url": raw_result["url"]}
 
+
+def enrich_step(candidate: dict) -> dict:
+    """
+    ACT (Enrichment): a second, targeted real web search on this
+    specific candidate, to gather the detail Scoring needs.
+    """
+    name = candidate["name"]
+    print(f"[ACT]  Enriching candidate: {name} ...")
+    query = f'"{name}" employees OR hiring OR funding OR headquarters'
     try:
-        cleaned = raw.strip().strip("`").removeprefix("json").strip()
-        parsed = json.loads(cleaned)
-    except (json.JSONDecodeError, AttributeError):
-        parsed = {"score": 0, "justification": f"Could not parse LLM output: {raw[:200]}"}
+        results = web_search(query, max_results=4)
+    except RuntimeError as exc:
+        print(f"[OBSERVE] Enrichment search failed for {name}: {exc}")
+        return {"name": name, "found": False}
 
+    if not results:
+        print(f"[OBSERVE] No enrichment data found for {name}")
+        return {"name": name, "found": False}
+
+    combined_content = "\n\n".join(r["content"][:500] for r in results)
+    prompt = f"""Extract structured firmographic details about "{name}" from these search snippets.
+Respond ONLY as JSON:
+{{"name": "{name}", "industry": "<industry or null>", "size_estimate": "<employee count/range or null>",
+  "location": "<location or null>", "hiring_signal": "<any hiring/growth signal mentioned, or null>",
+  "other_signal": "<any other relevant buying signal, or null>", "found": true}}
+
+Search snippets:
+{combined_content}"""
+
+    raw = call_llm([{"role": "user", "content": prompt}])
+    parsed = parse_llm_json(raw)
+    if parsed is None:
+        print(f"[OBSERVE] Could not parse enrichment for {name}")
+        return {"name": name, "found": False}
+
+    parsed["found"] = True
+    print(f"[OBSERVE] Enriched {name}: industry={parsed.get('industry')}, "
+          f"size={parsed.get('size_estimate')}")
     return parsed
 
 
-def run_pipeline():
-    icp = load_json(_ICP_PATH)
-    leads = load_json(_LEADS_PATH)
+def score_step(enriched: dict, spec: dict) -> dict:
+    """SCORE: LLM scores this enriched candidate against the criteria
+    derived from the ORIGINAL user goal (not a static rubric)."""
+    prompt = f"""Score this lead against the target criteria.
+
+Target criteria: {json.dumps(spec.get("criteria", []))}
+Scoring weights: {json.dumps(spec.get("scoring_weights", {}))}
+
+Lead data:
+{json.dumps(enriched, indent=2)}
+
+Respond ONLY as JSON: {{"score": <int 0-100>, "justification": "<1-2 sentences>"}}"""
+
+    print(f"[RESPOND] Scoring {enriched['name']} ...")
+    raw = call_llm([{"role": "user", "content": prompt}])
+    parsed = parse_llm_json(raw)
+    if parsed is None:
+        return {"score": 0, "justification": f"Could not parse LLM output: {raw[:200]}"}
+    return parsed
+
+
+def run_pipeline(user_goal: str) -> list[dict]:
+    spec = understand_step(user_goal)
+    plan_step(spec)
+    raw_results = find_step(spec)
+
+    if not raw_results:
+        print("\n[RESPOND] No candidates found for this goal.")
+        return []
 
     results = []
+    seen_names = set()
+    target_count = spec["target_count"]
 
-    for lead in leads:
-        email = lead["email"]
-        print("=" * 70)
-        print(f"Processing lead: {lead['name']} <{email}>")
+    for raw_result in raw_results:
+        if len(results) >= target_count:
+            break
 
-        plan_step(email)
-        enrichment_result = act_step(email)
-        ok = observe_step(enrichment_result)
+        try:
+            candidate = extract_candidate_step(raw_result, spec)
+        except RuntimeError as exc:
+            # All free LLM models exhausted for this call — this candidate
+            # can't be processed, but the rest of the batch still can be.
+            print(f"[OBSERVE] Could not extract candidate from {raw_result.get('title')!r}: {exc}")
+            continue
 
-        if not ok:
+        if candidate is None:
+            continue
+
+        # Different search results can surface the same organization twice.
+        dedup_key = candidate["name"].strip().lower()
+        if dedup_key in seen_names:
+            continue
+        seen_names.add(dedup_key)
+
+        try:
+            enriched = enrich_step(candidate)
+        except RuntimeError as exc:
+            print(f"[OBSERVE] Enrichment LLM call failed for {candidate['name']}: {exc}")
             results.append({
-                "name": lead["name"],
-                "email": email,
+                "name": candidate["name"],
+                "score": None,
+                "justification": "Skipped — enrichment failed (LLM unavailable).",
+            })
+            continue
+
+        if not enriched.get("found"):
+            results.append({
+                "name": candidate["name"],
                 "score": None,
                 "justification": "Skipped — no enrichment data found.",
             })
             continue
 
-        verdict = respond_step(enrichment_result, icp)
+        try:
+            verdict = score_step(enriched, spec)
+        except RuntimeError as exc:
+            print(f"[OBSERVE] Scoring LLM call failed for {enriched['name']}: {exc}")
+            results.append({
+                "name": enriched["name"],
+                "score": None,
+                "justification": "Skipped — scoring failed (LLM unavailable).",
+            })
+            continue
+
         results.append({
-            "name": enrichment_result["name"],
-            "email": email,
+            "name": enriched["name"],
             "score": verdict.get("score"),
             "justification": verdict.get("justification"),
+            "details": enriched,
         })
 
     print("\n" + "=" * 70)
@@ -140,14 +308,24 @@ def run_pipeline():
     scored.sort(key=lambda r: r["score"], reverse=True)
 
     for rank, r in enumerate(scored, start=1):
-        print(f"{rank}. {r['name']} ({r['email']}) — score: {r['score']}")
+        print(f"{rank}. {r['name']} — score: {r['score']}")
         print(f"   {r['justification']}")
 
     for r in unscored:
-        print(f"-  {r['name']} ({r['email']}) — unscored: {r['justification']}")
+        print(f"-  {r['name']} — unscored: {r['justification']}")
 
     return scored + unscored
 
 
 if __name__ == "__main__":
-    run_pipeline()
+    goal = " ".join(sys.argv[1:]).strip()
+    if not goal:
+        goal = input("Enter your lead-generation goal: ").strip()
+
+    try:
+        run_pipeline(goal)
+    except RuntimeError as exc:
+        print(f"\n[ERROR] Could not complete the run: {exc}")
+        print("All free-tier LLM models may be exhausted for today — "
+              "try again later, or add a paid OpenRouter key for higher limits.")
+        sys.exit(1)

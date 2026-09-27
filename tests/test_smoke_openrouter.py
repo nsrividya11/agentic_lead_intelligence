@@ -13,8 +13,8 @@ Checks:
      agent uses in production.
   3. The full call_llm() fallback path works against the live API
      (not just mocked responses).
-  4. The end-to-end agent.respond_step() produces a parseable score
-     against a real LLM call, on a real seed lead.
+  4. The end-to-end agent.score_step() produces a parseable score
+     against a real LLM call, on a realistic enriched-lead payload.
 """
 
 import sys
@@ -93,21 +93,29 @@ def smoke_test_call_llm_end_to_end_with_real_payload():
     print(f"[SMOKE] call_llm() live response (truncated): {result[:200]!r}")
 
 
-def smoke_test_full_respond_step_against_real_lead():
+def smoke_test_full_score_step_against_real_llm():
     """
-    True end-to-end: real seed lead data -> real enrichment lookup ->
-    real LLM call -> parsed score. This is the exact path run_pipeline()
-    takes for every lead.
+    True end-to-end: a realistic enriched-lead payload -> real LLM
+    call -> parsed score. This is the exact path run_pipeline() takes
+    for every enriched candidate.
     """
-    from agent import respond_step, load_json, _ICP_PATH
-    from tools.enrichment import search_company_info
+    from agent import score_step
 
-    icp = load_json(_ICP_PATH)
-    lead = search_company_info("aditi.rao@brightwave.io")
-    assert lead["found"] is True
+    spec = {
+        "criteria": ["100+ employees", "hiring AI engineers"],
+        "scoring_weights": {"100+ employees": 40, "hiring AI engineers": 60},
+    }
+    enriched_lead = {
+        "name": "Test Ed-Tech Co",
+        "industry": "Education",
+        "size_estimate": "500+",
+        "location": "Hyderabad",
+        "hiring_signal": "Actively hiring AI/ML engineers",
+        "found": True,
+    }
 
-    verdict = respond_step(lead, icp)
-    print(f"[SMOKE] Live scoring for Aditi Rao -> {verdict}")
+    verdict = score_step(enriched_lead, spec)
+    print(f"[SMOKE] Live scoring for Test Ed-Tech Co -> {verdict}")
 
     assert isinstance(verdict["score"], int)
     assert 0 <= verdict["score"] <= 100
@@ -122,7 +130,7 @@ if __name__ == "__main__":
     smoke_test_api_key_present()
     smoke_test_at_least_one_free_model_reachable()
     smoke_test_call_llm_end_to_end_with_real_payload()
-    smoke_test_full_respond_step_against_real_lead()
+    smoke_test_full_score_step_against_real_llm()
 
     print("=" * 70)
     print("SMOKE TEST PASSED — OpenRouter integration is live and working.")
