@@ -1,0 +1,37 @@
+[
+  {
+    "name": "Aditi Rao",
+    "email": "aditi.rao@brightwave.io",
+    "company": "Brightwave Analytics",
+    "title": "VP of Engineering",
+    "raw_signal": "Posted on LinkedIn about scaling a 40-person eng team and hiring interns for Q4."
+  },
+  {
+    "name": "Marcus Chen",
+    "email": "m.chen@fieldstonecap.com",
+    "company": "Fieldstone Capital",
+    "title": "Analyst",
+    "raw_signal": "Downloaded a whitepaper on AI hiring tools last week."
+  },
+  {
+    "name": "Priya Nair",
+    "email": "priya@loomworks.co",
+    "company": "Loomworks",
+    "title": "Head of Talent Acquisition",
+    "raw_signal": "Company just raised a Series A; job postings for 'AI Recruiter' went live."
+  },
+  {
+    "name": "Sam O'Donnell",
+    "email": "sam.o@retrofit-labs.com",
+    "company": "Retrofit Labs",
+    "title": "Founder & CEO",
+    "raw_signal": "No recent hiring activity found; company site last updated 8 months ago."
+  },
+  {
+    "name": "Neha Gupta",
+    "email": "neha.gupta@skywardsys.com",
+    "company": "Skyward Systems",
+    "title": "Engineering Manager",
+    "raw_signal": "Actively commenting on AI agent frameworks in developer forums; team is evaluating internship pipelines."
+  }
+]
