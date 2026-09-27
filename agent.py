@@ -240,6 +240,7 @@ def run_pipeline(user_goal: str) -> list[dict]:
     results = []
     seen_names = set()
     target_count = spec["target_count"]
+    rejected_count = 0
 
     for raw_result in raw_results:
         if len(results) >= target_count:
@@ -254,6 +255,8 @@ def run_pipeline(user_goal: str) -> list[dict]:
             continue
 
         if candidate is None:
+            rejected_count += 1
+            print(f"[OBSERVE] Not a specific candidate, skipped: {raw_result.get('title')!r}")
             continue
 
         # Different search results can surface the same organization twice.
@@ -303,6 +306,14 @@ def run_pipeline(user_goal: str) -> list[dict]:
     print("FINAL RANKED RESULTS")
     print("=" * 70)
 
+    if not results:
+        print(f"No candidates survived extraction — {rejected_count} of "
+              f"{len(raw_results)} raw search results were rejected as not being "
+              f"a specific, nameable match (e.g. directory/listicle pages rather "
+              f"than pages naming one real candidate). Try rephrasing the goal or "
+              f"making it more specific.")
+        return []
+
     scored = [r for r in results if r["score"] is not None]
     unscored = [r for r in results if r["score"] is None]
     scored.sort(key=lambda r: r["score"], reverse=True)
@@ -326,6 +337,6 @@ if __name__ == "__main__":
         run_pipeline(goal)
     except RuntimeError as exc:
         print(f"\n[ERROR] Could not complete the run: {exc}")
-        print("All free-tier LLM models may be exhausted for today — "
-              "try again later, or add a paid OpenRouter key for higher limits.")
+        print("All free-tier LLM models (Groq and OpenRouter) may be exhausted for today — "
+              "try again later, or add a paid key for higher limits.")
         sys.exit(1)

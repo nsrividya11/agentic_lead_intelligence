@@ -1,8 +1,10 @@
 """
-Thin wrapper around the OpenRouter API with fallback across multiple
-free-tier models. If one model is rate-limited, the client rotates to
-the next one in FREE_MODELS and retries — this doubles as the agent's
-"Workflow Robustness" story for the hackathon rubric.
+LLM client with a two-tier free-tier provider fallback: Groq first
+(much higher free daily limits), OpenRouter free models second. If a
+model on either provider is rate-limited or exhausted, the client
+rotates to the next one — this is the agent's "Workflow Robustness"
+story for the hackathon rubric, now spanning providers as well as
+models within a provider.
 """
 
 import os
@@ -12,19 +14,29 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Free-tier model slugs on OpenRouter (":free" suffix = no cost).
-# OpenRouter's free-model lineup changes over time — if a slug below
-# 404s, fetch the current list with:
+# Groq's free tier has much higher daily limits than OpenRouter's
+# free models, so it's tried first. Groq's model lineup changes over
+# time — if a slug below 404s, fetch the current list with:
+#   GET https://api.groq.com/openai/v1/models (Authorization: Bearer <key>)
+# and swap it in.
+GROQ_MODELS = [
+    "openai/gpt-oss-20b",
+    "openai/gpt-oss-120b",
+    "qwen/qwen3.8-27b",
+]
+
+# Free-tier model slugs on OpenRouter (":free" suffix = no cost), used
+# as fallback once Groq is exhausted. OpenRouter's free-model lineup
+# changes over time — if a slug below 404s, fetch the current list with:
 #   GET https://openrouter.ai/api/v1/models -> filter id.endswith(":free")
 # and swap it in. Nothing else in the agent needs to change.
-# Ordered by observed live availability (checked via
-# tests/test_smoke_openrouter.py) — models that were rate-limited at
-# last check are moved to the back so the happy path doesn't waste
-# retry time on them. Re-run the smoke test occasionally and reorder.
-FREE_MODELS = [
+OPENROUTER_FREE_MODELS = [
     "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
     "inclusionai/ling-3.0-flash-sante:free",
     "liquid/lfm-2.5-2.6b:free",
@@ -36,16 +48,22 @@ FREE_MODELS = [
     "google/gemma-4-26b-a4b-it:free",
 ]
 
+# Ordered (provider, url, api_key, model) tuples — Groq models first,
+# OpenRouter free models as fallback once Groq is exhausted/unavailable.
+_PROVIDER_CHAIN = [("groq", GROQ_URL, GROQ_API_KEY, m) for m in GROQ_MODELS] + [
+    ("openrouter", OPENROUTER_URL, OPENROUTER_API_KEY, m) for m in OPENROUTER_FREE_MODELS
+]
+
 _RETRY_WAIT_SECONDS = 8
 
 
-def _try_model(model: str, messages: list[dict], temperature: float) -> tuple[str | None, str | None]:
-    """Call one model once. Returns (content, error)."""
+def _try_model(url: str, api_key: str, model: str, messages: list[dict], temperature: float) -> tuple[str | None, str | None]:
+    """Call one model on one provider once. Returns (content, error)."""
     try:
         response = requests.post(
-            OPENROUTER_URL,
+            url,
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
             },
             json={"model": model, "messages": messages, "temperature": temperature},
@@ -68,20 +86,27 @@ def _try_model(model: str, messages: list[dict], temperature: float) -> tuple[st
 
 def call_llm(messages: list[dict], temperature: float = 0.2) -> str:
     """
-    Call free models in order. On a transient rate limit, retry that
-    same model once after a short wait before moving to the next model.
-    A daily-quota exhaustion ("free-models-per-day") is NOT transient —
-    waiting won't help within this run, so it skips straight to the
-    next model instead of wasting a retry.
+    Call Groq models first (higher free daily limits), then fall back
+    to OpenRouter's free models. On a transient rate limit, retry that
+    same model once after a short wait before moving to the next one.
+    A daily-quota exhaustion ("free-models-per-day", or a Groq
+    rate_limit_exceeded) is NOT transient — waiting won't help within
+    this run, so it skips straight to the next model instead of
+    wasting a retry.
     """
     last_error = None
-    for model in FREE_MODELS:
-        content, error = _try_model(model, messages, temperature)
+    for provider, url, api_key, model in _PROVIDER_CHAIN:
+        if not api_key:
+            continue  # provider not configured (e.g. no GROQ_API_KEY set)
+
+        content, error = _try_model(url, api_key, model, messages, temperature)
         if content is not None:
             return content
         last_error = error
 
-        is_daily_quota_exhausted = error and "free-models-per-day" in error
+        is_daily_quota_exhausted = error and (
+            "free-models-per-day" in error or "rate_limit_exceeded" in error
+        )
         is_transient_rate_limit = (
             not is_daily_quota_exhausted
             and error
@@ -89,17 +114,17 @@ def call_llm(messages: list[dict], temperature: float = 0.2) -> str:
         )
 
         if is_transient_rate_limit:
-            print(f"[OBSERVE] {model} rate-limited — retrying once after "
+            print(f"[OBSERVE] [{provider}] {model} rate-limited — retrying once after "
                   f"{_RETRY_WAIT_SECONDS}s before falling back ...")
             time.sleep(_RETRY_WAIT_SECONDS)
-            content, error = _try_model(model, messages, temperature)
+            content, error = _try_model(url, api_key, model, messages, temperature)
             if content is not None:
                 return content
             last_error = error
         elif is_daily_quota_exhausted:
-            print(f"[OBSERVE] {model} hit its daily free-tier quota — "
-                  f"skipping retry, falling back to next free model ...")
+            print(f"[OBSERVE] [{provider}] {model} hit its daily free-tier quota — "
+                  f"skipping retry, falling back to next model ...")
 
-        print(f"[OBSERVE] {model} failed, falling back to next free model ...")
+        print(f"[OBSERVE] [{provider}] {model} failed, falling back to next model ...")
 
-    raise RuntimeError(f"All free models failed. Last error: {last_error}")
+    raise RuntimeError(f"All free models across all providers failed. Last error: {last_error}")

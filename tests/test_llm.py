@@ -1,7 +1,7 @@
 """
-Unit tests for tools/llm.py — the OpenRouter client with free-model
-fallback and retry. All HTTP calls are mocked here; the real network
-smoke test lives in tests/test_smoke_openrouter.py.
+Unit tests for tools/llm.py — the two-tier Groq-then-OpenRouter free
+client with model fallback and retry. All HTTP calls are mocked here;
+the real network smoke test lives in tests/test_smoke_openrouter.py.
 """
 
 import sys
@@ -69,7 +69,10 @@ def test_recovers_immediately_if_retry_succeeds(monkeypatch):
 
 def test_raises_when_all_models_exhausted(monkeypatch):
     monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
-    monkeypatch.setattr(llm, "FREE_MODELS", ["model-a:free", "model-b:free"])
+    monkeypatch.setattr(llm, "_PROVIDER_CHAIN", [
+        ("groq", llm.GROQ_URL, "fake-groq-key", "model-a"),
+        ("openrouter", llm.OPENROUTER_URL, "fake-or-key", "model-b:free"),
+    ])
 
     fail = _fake_response(429, {"error": {"message": "rate limited"}})
     with patch("tools.llm.requests.post", return_value=fail):
@@ -77,7 +80,67 @@ def test_raises_when_all_models_exhausted(monkeypatch):
             llm.call_llm([{"role": "user", "content": "hi"}])
             assert False, "expected RuntimeError"
         except RuntimeError as exc:
-            assert "All free models failed" in str(exc)
+            assert "All free models across all providers failed" in str(exc)
+
+
+def test_falls_back_from_groq_to_openrouter_across_providers(monkeypatch):
+    """
+    The core new behavior: when every Groq model fails, call_llm must
+    continue into the OpenRouter models rather than stopping at the
+    end of the Groq tier.
+    """
+    monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(llm, "_PROVIDER_CHAIN", [
+        ("groq", llm.GROQ_URL, "fake-groq-key", "groq-model-a"),
+        ("groq", llm.GROQ_URL, "fake-groq-key", "groq-model-b"),
+        ("openrouter", llm.OPENROUTER_URL, "fake-or-key", "or-model:free"),
+    ])
+
+    groq_fail = _fake_response(404, {"error": {"message": "model not found"}})
+    or_ok = _fake_response(200, {"choices": [{"message": {"content": "openrouter saved it"}}]})
+
+    with patch("tools.llm.requests.post", side_effect=[groq_fail, groq_fail, or_ok]):
+        result = llm.call_llm([{"role": "user", "content": "hi"}])
+        assert result == "openrouter saved it"
+
+
+def test_skips_provider_with_no_api_key_configured(monkeypatch):
+    """If GROQ_API_KEY is unset (falsy), Groq entries in the chain must
+    be skipped without making a request, falling straight to OpenRouter."""
+    monkeypatch.setattr(llm.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(llm, "_PROVIDER_CHAIN", [
+        ("groq", llm.GROQ_URL, None, "groq-model-a"),
+        ("openrouter", llm.OPENROUTER_URL, "fake-or-key", "or-model:free"),
+    ])
+
+    or_ok = _fake_response(200, {"choices": [{"message": {"content": "openrouter only"}}]})
+    with patch("tools.llm.requests.post", return_value=or_ok) as mock_post:
+        result = llm.call_llm([{"role": "user", "content": "hi"}])
+        assert result == "openrouter only"
+        assert mock_post.call_count == 1  # groq entry skipped entirely, no HTTP call made
+
+
+def test_groq_rate_limit_exceeded_treated_as_daily_quota_not_transient(monkeypatch):
+    """Groq's daily-quota error message differs from OpenRouter's
+    ("rate_limit_exceeded" vs "free-models-per-day") — both must skip
+    the retry-and-wait path."""
+    sleep_calls = []
+    monkeypatch.setattr(llm.time, "sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(llm, "_PROVIDER_CHAIN", [
+        ("groq", llm.GROQ_URL, "fake-groq-key", "groq-model-a"),
+        ("openrouter", llm.OPENROUTER_URL, "fake-or-key", "or-model:free"),
+    ])
+
+    groq_quota_exhausted = _fake_response(429, {
+        "error": {"message": "rate_limit_exceeded: daily token limit reached", "type": "rate_limit_exceeded"}
+    })
+    or_ok = _fake_response(200, {"choices": [{"message": {"content": "fell back cleanly"}}]})
+
+    with patch("tools.llm.requests.post", side_effect=[groq_quota_exhausted, or_ok]) as mock_post:
+        result = llm.call_llm([{"role": "user", "content": "hi"}])
+        assert result == "fell back cleanly"
+        assert sleep_calls == []  # no wasted retry wait
+        assert mock_post.call_count == 2  # one groq attempt, no retry, one openrouter attempt
 
 
 def test_daily_quota_exhaustion_skips_retry_and_falls_back_immediately(monkeypatch):
@@ -153,6 +216,9 @@ if __name__ == "__main__":
     test_retries_once_on_429_before_falling_back(ctx)
     test_recovers_immediately_if_retry_succeeds(ctx)
     test_raises_when_all_models_exhausted(ctx)
+    test_falls_back_from_groq_to_openrouter_across_providers(ctx)
+    test_skips_provider_with_no_api_key_configured(ctx)
+    test_groq_rate_limit_exceeded_treated_as_daily_quota_not_transient(ctx)
     test_daily_quota_exhaustion_skips_retry_and_falls_back_immediately(ctx)
     test_embedded_error_in_200_response_is_treated_as_failure()
     test_handles_200_with_empty_choices()

@@ -241,6 +241,37 @@ def test_run_pipeline_returns_empty_when_no_candidates_found():
     assert results == []
 
 
+def test_run_pipeline_returns_empty_when_all_candidates_rejected_by_extraction():
+    """
+    Raw search results can come back non-empty (e.g. directory/listicle
+    pages) but every one of them can fail the relevance check in
+    extract_candidate_step. This must still surface as an empty result
+    list, distinct from find_step finding zero raw results at all.
+    """
+    spec_output = """{
+        "search_queries": ["test query"], "target_count": 3, "entity_type": "company",
+        "criteria": ["some criterion"], "scoring_weights": {"some criterion": 100}
+    }"""
+    raw_results = [
+        {"title": "List of top companies", "url": "http://directory.com", "content": "..."},
+        {"title": "Another directory page", "url": "http://directory2.com", "content": "..."},
+    ]
+
+    def fake_call_llm(messages, **kwargs):
+        prompt = messages[0]["content"]
+        if "structured task spec" in prompt:
+            return spec_output
+        if "SPECIFIC, NAMEABLE candidate" in prompt:
+            return '{"name": null, "reason": "this is a directory listing, not one candidate"}'
+        raise AssertionError(f"Unexpected prompt: {prompt[:100]}")
+
+    with patch("agent.call_llm", side_effect=fake_call_llm), \
+         patch("agent.web_search", return_value=raw_results):
+        results = agent.run_pipeline("find 3 test companies")
+
+    assert results == []
+
+
 def test_run_pipeline_survives_one_candidate_exhausting_all_llm_models():
     """
     If the LLM is fully exhausted (all free models fail) while processing
@@ -305,5 +336,6 @@ if __name__ == "__main__":
     test_score_step_handles_malformed_output()
     test_run_pipeline_end_to_end_ranks_scored_above_unscored()
     test_run_pipeline_returns_empty_when_no_candidates_found()
+    test_run_pipeline_returns_empty_when_all_candidates_rejected_by_extraction()
     test_run_pipeline_survives_one_candidate_exhausting_all_llm_models()
     print("All agent tests passed.")

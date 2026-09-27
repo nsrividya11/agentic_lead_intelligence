@@ -42,21 +42,23 @@ run_pipeline(user_goal)
 Both external calls are live:
 
 - **Search**: [Tavily](https://tavily.com) — a free-tier search API purpose-built for LLM agents. `tools/search.py` calls it twice per candidate: once (via multiple query variants) to discover candidates, once per candidate to enrich it.
-- **Reasoning**: [OpenRouter](https://openrouter.ai), using only free-tier (`:free`) models, per contest fairness guidelines.
+- **Reasoning**: [Groq](https://groq.com) as the primary provider, with [OpenRouter](https://openrouter.ai) free-tier (`:free`) models as fallback — both free, per contest fairness guidelines.
 
 Nothing about the entity type, criteria, or scoring rubric is hardcoded — they're all derived by the LLM from whatever the user typed.
 
-## LLM: OpenRouter, free-tier only, with fallback
+## LLM: Groq primary, OpenRouter fallback, both free-tier
 
-`tools/llm.py` calls a list of free models in priority order:
+`tools/llm.py` calls a two-tier provider chain in priority order — Groq models first, then OpenRouter's free models:
 1. Try the current model.
 2. On a **transient** rate limit (429/502/embedded provider error), wait briefly and retry once.
-3. On a **daily quota exhaustion** ("free-models-per-day"), skip the retry — it won't clear within the run — and fall back immediately.
-4. If a model fails either way, rotate to the next free model.
+3. On a **daily quota exhaustion** (OpenRouter's "free-models-per-day", or Groq's "rate_limit_exceeded"), skip the retry — it won't clear within the run — and fall back immediately.
+4. If a model fails either way, rotate to the next model; once every Groq model is exhausted, the chain continues into OpenRouter's free models automatically.
 
-> OpenRouter's free tier caps out at roughly 50 requests/day account-wide unless a small credit balance is added (their own error message: *"Add 10 credits to unlock 1000 free model requests per day"*). Heavy testing in one day can exhaust it — this is a real constraint of the free tier, not a bug.
+Groq is tried first because its free tier has substantially higher daily limits than OpenRouter's free models, so it absorbs the bulk of normal usage; OpenRouter is the safety net if Groq has an outage or its own limits are hit.
+
+> OpenRouter's free tier caps out at roughly 50 requests/day account-wide unless a small credit balance is added (their own error message: *"Add 10 credits to unlock 1000 free model requests per day"*). Heavy testing in one day can exhaust it — this is a real constraint of the free tier, not a bug, and is exactly why Groq is the primary provider.
 >
-> OpenRouter's free-model catalog also changes over time. If a model slug in `FREE_MODELS` (`tools/llm.py`) starts 404ing, refresh it via `GET https://openrouter.ai/api/v1/models` → filter for `id` ending in `:free`.
+> Both providers' free-model catalogs change over time. If a model slug in `GROQ_MODELS` or `OPENROUTER_FREE_MODELS` (`tools/llm.py`) starts 404ing, refresh it via `GET https://api.groq.com/openai/v1/models` or `GET https://openrouter.ai/api/v1/models` respectively.
 
 ## Setup & run (CLI)
 
@@ -69,10 +71,12 @@ pip install -r requirements.txt
 Create a `.env` file:
 
 ```
+GROQ_API_KEY=your_groq_key
 OPENROUTER_API_KEY=your_openrouter_key
 TAVILY_API_KEY=your_tavily_key
 ```
 
+- Get a free Groq key at [console.groq.com/keys](https://console.groq.com/keys) — no payment method required.
 - Get a free OpenRouter key at [openrouter.ai/keys](https://openrouter.ai/keys) — no payment method required for free-tier models.
 - Get a free Tavily key at [tavily.com](https://tavily.com) — no card required for the free tier.
 
